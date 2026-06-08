@@ -1,154 +1,268 @@
 import os
+import json
 import cv2
 import numpy as np
 import pandas as pd
 import mediapipe as mp
 import tensorflow as tf
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 
 # ==========================================
-# CẤU HÌNH CƠ BẢN
+# ĐỌC CẤU HÌNH CHUNG TỪ config.py
 # ==========================================
-VIDEO_DIR = r"C:\Users\Home\OneDrive\Nhận diện ngôn ngữ cử chỉ\Dataset\Video" 
-LABEL_FILE = r"C:\Users\Home\OneDrive\Nhận diện ngôn ngữ cử chỉ\Dataset\Label\label.csv" 
+from config import (
+    VIDEO_DIR, LABEL_FILE, MODEL_PATH, NAMES_PATH,
+    MAX_FRAMES, MAX_NUM_HANDS, MIN_DETECTION_CONF, MIN_TRACKING_CONF,
+    EPOCHS, BATCH_SIZE, TEST_SPLIT, RANDOM_SEED, ACTIONS,
+)
 
-MAX_FRAMES = 20      
-# CHÚ Ý: Danh sách này PHẢI khớp 100% với CLASS_NAMES trong file webcam.py
-ACTIONS = np.array(['Địa chỉ', 'Không cho', 'Không nên', 'Mù chữ', 'Chào', 'Tạm biệt'])
+ACTIONS = np.array(ACTIONS)
 
-# Khởi tạo MediaPipe Hands
+# ==========================================
+# PHẦN 1: TRÍCH XUẤT TỌA ĐỘ BẰNG MEDIAPIPE
+# ==========================================
 mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2, min_detection_confidence=0.5)
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=MAX_NUM_HANDS,
+    min_detection_confidence=MIN_DETECTION_CONF,
+    min_tracking_confidence=MIN_TRACKING_CONF,
+)
 
-# ==========================================
-# PHẦN 1: HÀM TRÍCH XUẤT TỌA ĐỘ BẰNG MEDIAPIPE
-# ==========================================
-def extract_keypoints(frame):
-    """Xử lý 1 frame ảnh, trả về mảng 126 tọa độ (2 bàn tay)"""
+
+def extract_keypoints(frame: np.ndarray) -> np.ndarray:
+    """Xử lý 1 frame, trả về mảng 126 tọa độ (2 bàn tay × 21 điểm × xyz)."""
     img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = hands.process(img_rgb)
-    
-    # Tạo mảng 126 số 0 (nếu không thấy tay, dữ liệu sẽ là số 0)
-    data = np.zeros(126) 
-    
+
+    data = np.zeros(126, dtype=np.float32)
     if results.multi_hand_landmarks:
-        for i, hand_landmarks in enumerate(results.multi_hand_landmarks):
-            if i > 1: break # Chỉ lấy tối đa 2 tay
-            # Lấy 21 điểm x, y, z và làm phẳng thành mảng 1 chiều (63 số)
-            hand_data = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark]).flatten()
-            # Ghép vào mảng 126 số tổng
-            data[i*63 : (i+1)*63] = hand_data
-            
+        for i, hand_lm in enumerate(results.multi_hand_landmarks):
+            if i >= 2:
+                break
+            hand_data = np.array(
+                [[lm.x, lm.y, lm.z] for lm in hand_lm.landmark],
+                dtype=np.float32,
+            ).flatten()
+            data[i * 63 : (i + 1) * 63] = hand_data
     return data
 
-def process_video_to_landmarks(video_path, max_frames=20):
-    """Đọc video và trích xuất tọa độ cho đủ 20 frames"""
+
+def process_video(video_path: str, max_frames: int = MAX_FRAMES) -> np.ndarray:
+    """
+    Đọc video, lấy mẫu đều max_frames khung hình rồi trích xuất tọa độ.
+    Trả về mảng (max_frames, 126).
+    """
     cap = cv2.VideoCapture(video_path)
-    frames_data = []
-    
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    step = max(total_frames // max_frames, 1) if total_frames > 0 else 1
-    
-    for i in range(max_frames):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, i * step)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if total > 0:
+        indices = np.linspace(0, total - 1, max_frames, dtype=int)
+    else:
+        indices = np.zeros(max_frames, dtype=int)
+
+    frames_data: list[np.ndarray] = []
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
         ret, frame = cap.read()
-        if not ret:
-            break
-            
-        # Thay vì lưu ảnh, ta trích xuất và lưu mảng 126 tọa độ
-        landmarks = extract_keypoints(frame)
-        frames_data.append(landmarks)
-        
-    cap.release()
-    
-    # Nếu video ngắn, không đủ max_frames, ta nhân bản frame cuối cùng
-    while len(frames_data) < max_frames:
-        if frames_data:
+        if ret:
+            frames_data.append(extract_keypoints(frame))
+        elif frames_data:
             frames_data.append(frames_data[-1])
         else:
-            frames_data.append(np.zeros(126))
-            
-    return np.array(frames_data)
+            frames_data.append(np.zeros(126, dtype=np.float32))
+
+    cap.release()
+
+    while len(frames_data) < max_frames:
+        frames_data.append(frames_data[-1] if frames_data else np.zeros(126, dtype=np.float32))
+
+    return np.array(frames_data, dtype=np.float32)   # (max_frames, 126)
+
 
 # ==========================================
 # PHẦN 2: TẢI VÀ CHUẨN BỊ DỮ LIỆU
 # ==========================================
-X = []
-y = []
-label_dict = {}
+def load_labels(label_file: str) -> dict[str, str]:
+    """Đọc file CSV, trả về dict {tên_video: nhãn}."""
+    df = pd.read_csv(label_file, header=None, dtype=str)
 
-print("Đang đọc file nhãn label.csv...")
-try:
-    # Lấy nhãn từ file CSV (cột 1 là tên video, cột 2 là nhãn)
-    df = pd.read_csv(LABEL_FILE, header=None)
-    
-    # Bỏ qua dòng tiêu đề nếu có
-    if df.iloc[0, 1] == 'VIDEO':
+    if df.iloc[0, 1].strip().upper() == "VIDEO":
         df = df.iloc[1:]
-        
-    for index, row in df.iterrows():
+
+    label_dict: dict[str, str] = {}
+    for _, row in df.iterrows():
         video_name = str(row[1]).strip()
-        label = str(row[2]).strip()
+        label      = str(row[2]).strip()
         label_dict[video_name] = label
-        
-    print(f"-> Đã trích xuất {len(label_dict)} nhãn từ file CSV.")
-except Exception as e:
-    print(f"LỖI khi đọc file CSV: {e}")
-    exit()
+    return label_dict
 
-print("\nĐang dùng MediaPipe quét qua các video... (Quá trình này sẽ mất một lúc)")
-count_processed = 0
 
-for video_name in os.listdir(VIDEO_DIR):
-    if not video_name.endswith(('.mp4', '.avi', '.mov')):
-        continue
-        
-    if video_name in label_dict:
-        label = label_dict[video_name]
-        
-        # Chỉ lấy những video có nhãn nằm trong mảng ACTIONS
-        if label in ACTIONS:
-            label_idx = np.where(ACTIONS == label)[0][0]
-            video_path = os.path.join(VIDEO_DIR, video_name)
-            
-            # Trích xuất dữ liệu: (20, 126)
-            video_landmarks = process_video_to_landmarks(video_path, max_frames=MAX_FRAMES)
-            
-            X.append(video_landmarks)
-            y.append(label_idx)
-            
-            count_processed += 1
-            if count_processed % 10 == 0:
-                print(f"... Đã xử lý {count_processed} video")
+def build_dataset(
+    video_dir: str,
+    label_dict: dict[str, str],
+    actions: np.ndarray,
+    max_frames: int = MAX_FRAMES,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Duyệt qua thư mục video, trích xuất đặc trưng và tạo X, y."""
+    X_list: list[np.ndarray] = []
+    y_list: list[int]        = []
 
-X = np.array(X, dtype=np.float32)
-y = np.array(y, dtype=np.int32)
+    action_set = set(actions)
+    video_files = [
+        f for f in os.listdir(video_dir)
+        if f.lower().endswith((".mp4", ".avi", ".mov"))
+    ]
 
-print(f"\n--- TỔNG KẾT DỮ LIỆU ---")
-print(f"Kích thước tập đầu vào X: {X.shape} (N video, 20 frames, 126 tọa độ)")
-print(f"Kích thước tập đầu ra y: {y.shape}")
+    print(f"Tìm thấy {len(video_files)} file video trong thư mục.")
+
+    for i, video_name in enumerate(video_files, 1):
+        label = label_dict.get(video_name)
+        if label not in action_set:
+            continue
+
+        label_idx  = int(np.where(actions == label)[0][0])
+        video_path = os.path.join(video_dir, video_name)
+
+        landmarks = process_video(video_path, max_frames)
+        X_list.append(landmarks)
+        y_list.append(label_idx)
+
+        if i % 10 == 0:
+            print(f"  ... Đã xử lý {i}/{len(video_files)} video")
+
+    X = np.array(X_list, dtype=np.float32)
+    y = np.array(y_list,  dtype=np.int32)
+    return X, y
+
 
 # ==========================================
-# PHẦN 3 & 4: XÂY DỰNG AI & HUẤN LUYỆN
+# PHẦN 3: XÂY DỰNG MÔ HÌNH
 # ==========================================
-if len(X) == 0:
-    print("\nLỖI: Không trích xuất được dữ liệu nào. Hãy kiểm tra lại thư mục Video!")
-else:
-    # Mạng LSTM chuyên xử lý dữ liệu chuỗi (chuỗi 20 khung hình)
-    model = Sequential()
-    model.add(LSTM(64, return_sequences=True, activation='relu', input_shape=(MAX_FRAMES, 126)))
-    model.add(LSTM(128, return_sequences=False, activation='relu'))
-    model.add(Dense(64, activation='relu'))
-    model.add(Dropout(0.2)) # Chống học vẹt (overfitting)
-    model.add(Dense(len(ACTIONS), activation='softmax')) # Lớp cuối có 6 nơ-ron
+def build_model(num_frames: int, num_features: int, num_classes: int) -> tf.keras.Model:
+    """Xây dựng mạng LSTM hai tầng với BatchNorm và Dropout."""
+    model = Sequential([
+        LSTM(64, return_sequences=True, activation="tanh",
+             input_shape=(num_frames, num_features)),
+        BatchNormalization(),
+        Dropout(0.3),
 
-    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+        LSTM(128, return_sequences=False, activation="tanh"),
+        BatchNormalization(),
+        Dropout(0.3),
+
+        Dense(64, activation="relu"),
+        Dropout(0.2),
+
+        Dense(num_classes, activation="softmax"),
+    ])
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+    return model
+
+
+# ==========================================
+# PHẦN 4: HUẤN LUYỆN
+# ==========================================
+def train(X: np.ndarray, y: np.ndarray, actions: np.ndarray) -> tf.keras.Model:
+    """Chia tập train/val, tính class weight, huấn luyện với callbacks."""
+    num_classes = len(actions)
+
+    min_samples_for_split = num_classes * 2
+    use_validation = len(X) >= min_samples_for_split * 2
+
+    if use_validation:
+        test_size = max(TEST_SPLIT, num_classes / len(X))
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=test_size, random_state=RANDOM_SEED, stratify=y
+        )
+        print(f"\nTập huấn luyện : {len(X_train)} mẫu")
+        print(f"Tập validation : {len(X_val)} mẫu")
+    else:
+        X_train, y_train = X, y
+        X_val,   y_val   = None, None
+        print(f"\nDữ liệu ít ({len(X)} mẫu / {num_classes} lớp) → train trên toàn bộ, không chia validation.")
+        print("  Gợi ý: thêm ít nhất 6 video mỗi lớp để dùng được validation.\n")
+
+    class_weights_arr = compute_class_weight(
+        class_weight="balanced", classes=np.unique(y_train), y=y_train
+    )
+    class_weights = dict(enumerate(class_weights_arr))
+
+    effective_batch = min(BATCH_SIZE, max(len(X_train) // 4, 1))
+    if effective_batch != BATCH_SIZE:
+        print(f"  Batch size tự điều chỉnh: {BATCH_SIZE} → {effective_batch}")
+
+    model = build_model(
+        num_frames=MAX_FRAMES,
+        num_features=126,
+        num_classes=num_classes,
+    )
     model.summary()
 
-    print("\nBắt đầu huấn luyện...")
-    # Vì dữ liệu lúc này chỉ là các con số tọa độ nên train sẽ cực kỳ nhanh!
-    model.fit(X, y, epochs=150, batch_size=4, validation_split=0.2)
-    
-    model.save("gesture_mediapipe_model.h5")
-    print("\n-> Xong! Đã tạo file 'gesture_mediapipe_model.h5' chuẩn cho 6 từ.")
+    if use_validation:
+        callbacks = [
+            EarlyStopping(monitor="val_loss", patience=20, restore_best_weights=True,
+                          verbose=1),
+            ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=10,
+                              min_lr=1e-5, verbose=1),
+            ModelCheckpoint(MODEL_PATH, monitor="val_accuracy", save_best_only=True,
+                            verbose=1),
+        ]
+        fit_kwargs = dict(validation_data=(X_val, y_val))
+    else:
+        callbacks = [
+            ModelCheckpoint(MODEL_PATH, monitor="accuracy", save_best_only=True,
+                            verbose=1),
+        ]
+        fit_kwargs = {}
+
+    print("\nBắt đầu huấn luyện...\n")
+    model.fit(
+        X_train, y_train,
+        epochs=EPOCHS,
+        batch_size=effective_batch,
+        class_weight=class_weights,
+        callbacks=callbacks,
+        verbose=1,
+        **fit_kwargs,
+    )
+    return model
+
+
+# ==========================================
+# CHƯƠNG TRÌNH CHÍNH
+# ==========================================
+if __name__ == "__main__":
+    print("Đang đọc file nhãn...")
+    label_dict = load_labels(LABEL_FILE)
+    print(f"  -> {len(label_dict)} nhãn được tải.")
+
+    print("\nĐang trích xuất tọa độ từ video...")
+    X, y = build_dataset(VIDEO_DIR, label_dict, ACTIONS, MAX_FRAMES)
+
+    if len(X) == 0:
+        print("\nLỖI: Không trích xuất được dữ liệu nào. "
+              "Kiểm tra lại thư mục Video và file Label.csv!")
+    else:
+        print(f"\n--- TỔNG KẾT DỮ LIỆU ---")
+        print(f"X : {X.shape}  (số video, số frame, số tọa độ)")
+        print(f"y : {y.shape}")
+        for idx, action in enumerate(ACTIONS):
+            print(f"  Lớp {idx} '{action}': {(y == idx).sum()} mẫu")
+
+        model = train(X, y, ACTIONS)
+
+        with open(NAMES_PATH, "w", encoding="utf-8") as f:
+            json.dump(ACTIONS.tolist(), f, ensure_ascii=False, indent=2)
+
+        print(f"\n✓ Mô hình đã lưu tại : {MODEL_PATH}")
+        print(f"✓ Nhãn đã lưu tại    : {NAMES_PATH}")
