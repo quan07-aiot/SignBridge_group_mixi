@@ -13,7 +13,7 @@ Dự án ứng dụng Computer Vision và Deep Learning (mạng LSTM) để phá
 ### Cài đặt thư viện
 Bạn cần cài đặt các thư viện sau (có thể chạy lệnh dưới đây trong terminal):
 ```
-pip install tensorflow mediapipe opencv-python numpy pandas scikit-learn Pillow
+pip install mediapipe==0.10.5 numpy==2.1.3 opencv-python==4.13.0.92 pandas==3.0.3 pillow==12.2.0 scikit-learn==1.9.0 tensorflow==2.19.1 gTTS==2.5.4 pygame==2.6.1 Kivy==2.3.1 kivymd==1.2.0 kivy-deps.angle==0.4.0 kivy-deps.glew==0.3.1 kivy_deps.sdl2==0.8.0
 ```
 
 ## 3. Các bước chạy chương trình
