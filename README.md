@@ -34,9 +34,9 @@ Chạy file training.py để trích xuất đặc trưng tọa độ tay từ v
 python training.py
 ```
 ### Bước 4: Nhận diện qua App
-Sau khi mô hình huấn luyện xong, chạy file app1.py để bật camera và bắt đầu quá trình nhận diện cử chỉ theo thời gian thực.
+Sau khi mô hình huấn luyện xong, chạy file app2.py để bật camera và bắt đầu quá trình nhận diện cử chỉ theo thời gian thực.
 ```
-python app1.py
+python .py
 ```
 ## 4. Các cử chỉ hiện có (Available Gestures)
 Hệ thống hiện tại đang được huấn luyện và có khả năng nhận diện các cử chỉ giao tiếp cơ bản sau:
