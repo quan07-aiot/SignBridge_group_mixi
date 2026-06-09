@@ -57,9 +57,12 @@ Hệ thống hiện tại đang được huấn luyện và có khả năng nh�
 🧠 Improved AI Model: Cải tiến và tối ưu hóa kiến trúc mạng AI nhằm tăng độ chính xác và tốc độ xử lý khung hình.
 
 ## 6. Người đóng góp (Contributors)
-Hoàng Mạnh Quân (https://github.com/quan07-aiot) 
+Hoàng Mạnh Quân (https://github.com/quan07-aiot)   
+
 Phạm Mạnh Thái (https://github.com/mthai-p)
+
 Đỗ Thành Long (https://github.com/dtlonginhy)
+
 Trịnh Đăng Khôi
 
 Nhóm Mixi
